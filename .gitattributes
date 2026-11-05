@@ -1,0 +1,14 @@
+# Шелл-скрипты обязаны остаться с LF — иначе в WSL получим
+# `/bin/bash^M: bad interpreter`, а конфиги nginx не прочитаются.
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.py        text eol=lf
+*.tmpl      text eol=lf
+.env.example text eol=lf
+.gitattributes text eol=lf
+*.md        text

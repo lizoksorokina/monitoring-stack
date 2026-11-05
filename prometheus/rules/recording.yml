@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  RECORDING RULES
+#
+#  Зачем: тяжёлые выражения (rate по 5 минутам, histogram_quantile) считаются
+#  ОДИН раз здесь и сохраняются как новая метрика. Дальше и алерты, и дашборды
+#  читают уже готовое значение — это быстрее и, главное, единообразно:
+#  на графике и в алерте одна и та же формула, а не две разные.
+#
+#  Соглашение об именах: level:metric:operations
+#    job:http_requests:rate5m  → агрегировано по job, метрика http_requests, окно 5m
+# ─────────────────────────────────────────────────────────────────────────────
+groups:
+  # ── HTTP: RED-метрики (Rate, Errors, Duration) ────────────────────────────
+  - name: http-recording
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      # ВАЖНО: `или умножить знаменатель на 0` — не украшение.
+      # Если ошибок нет вообще, числитель (rate по 5xx) — ПУСТОЙ вектор,
+      # и любое деление на нём даёт пустоту, а не 0. Тогда панель «доля ошибок»
+      # и алерт на SLO показывают «No data» вместо честного нуля.
+      # Конструкция `X or Y*0` подставляет нули с нужными лейблами.
+      - record: job:http_errors:ratio5m
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+              or
+            sum by (job) (rate(http_requests_total[5m])) * 0
+          )
+            /
+          sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_errors:ratio1h
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[1h]))
+              or
+            sum by (job) (rate(http_requests_total[1h])) * 0
+          )
+            /
+          sum by (job) (rate(http_requests_total[1h]))
+
+      - record: job:http_errors:ratio6h
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[6h]))
+              or
+            sum by (job) (rate(http_requests_total[6h])) * 0
+          )
+            /
+          sum by (job) (rate(http_requests_total[6h]))
+
+      - record: job:http_request_duration_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m])))
+
+      - record: job:http_request_duration_seconds:p99
+        expr: histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m])))
+
+      # Те же величины, но с разбивкой по instance — нужны алертам.
+      # Алерт без лейбла instance нельзя ни заглушить инхибитором, ни
+      # показать «на каком хосте беда», поэтому дублируем уровень.
+      - record: instance:http_errors:ratio5m
+        expr: |
+          (
+            sum by (job, instance) (rate(http_requests_total{status=~"5.."}[5m]))
+              or
+            sum by (job, instance) (rate(http_requests_total[5m])) * 0
+          )
+            /
+          sum by (job, instance) (rate(http_requests_total[5m]))
+
+      - record: instance:http_request_duration_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le, job, instance) (rate(http_request_duration_seconds_bucket[5m])))
+
+      # Доступность за час: 1 - доля 5xx. Именно её сравниваем с SLO.
+      - record: job:slo_availability:ratio1h
+        expr: 1 - job:http_errors:ratio1h
+
+  # ── Хост: USE-метрики (Utilization, Saturation, Errors) ───────────────────
+  - name: node-recording
+    interval: 30s
+    rules:
+      - record: instance:node_cpu:rate5m
+        expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+
+      - record: instance:node_memory_used:ratio
+        expr: 1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+      - record: instance:node_filesystem_used:ratio
+        expr: |
+          1 - (
+            node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs", mountpoint!~"/boot.*"}
+              /
+            node_filesystem_size_bytes{fstype=~"ext4|xfs|btrfs", mountpoint!~"/boot.*"}
+          )
+
+  # ── Приложение: бизнес-метрики ────────────────────────────────────────────
+  - name: app-recording
+    interval: 30s
+    rules:
+      - record: app:orders_created:rate5m
+        expr: sum(rate(app_orders_created_total[5m]))
+
+      - record: app:payments_failed:ratio5m
+        expr: |
+          sum(rate(app_payment_failures_total[5m]))
+            /
+          sum(rate(app_orders_created_total[5m]))

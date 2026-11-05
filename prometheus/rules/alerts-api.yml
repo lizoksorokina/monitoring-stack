@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  ALERTING RULES — прикладной уровень (наш API)
+#
+#  Как читать: alert = условие (expr) + сколько времени оно должно держаться
+#  (for), прежде чем реально «загорится». Без for любой единичный всплеск
+#  превращается в алерт — это главная причина, почему алертам перестают верить.
+# ─────────────────────────────────────────────────────────────────────────────
+groups:
+  - name: api-availability
+    rules:
+      # Сервис не отдаёт /metrics. Это самый надёжный сигнал: либо процесс
+      # умер, либо сеть, либо порт. Срабатывает быстро — минута.
+      - alert: ServiceDown
+        expr: up{job="app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API недоступен — {{ $labels.instance }}"
+          description: "Prometheus не может собрать метрики с {{ $labels.instance }} дольше 1 минуты."
+
+      # Общий случай: любая цель, которую перестали скрейпить.
+      - alert: TargetDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: "Цель {{ $labels.job }} не отвечает"
+          description: "{{ $labels.instance }} (job={{ $labels.job }}) не отвечает на скрейп дольше 5 минут."
+
+  - name: api-red
+    rules:
+      # Доля 5xx выше 5% пять минут подряд. Ошибки считаем только по 5xx:
+      # 4xx — это поведение клиента, а не сбой сервиса.
+      - alert: HighErrorRate
+        expr: instance:http_errors:ratio5m{job="app"} > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Высокая доля ошибок: {{ $value | humanizePercentage }}"
+          description: "На {{ $labels.instance }} доля ответов 5xx держится выше 5% уже 5 минут."
+
+      # «Горит быстро»: за час сожгли больше, чем 14.4 бюджета ошибок.
+      # 14.4 и 6 — множители из SRE Workbook для SLO 99.5%.
+      - alert: SLOFastBurn
+        expr: job:http_errors:ratio1h{job="app"} > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "SLO 99.5% горит быстро ({{ $value | humanizePercentage }} ошибок за час)"
+          description: "Порог быстрого прожига — 7.2% ошибок за 1 час. При таких темпах месячный бюджет сгорит за ~2 суток."
+
+      # «Тлеет»: медленный, но устойчивый рост ошибок за 6 часов.
+      - alert: SLOSlowBurn
+        expr: job:http_errors:ratio6h{job="app"} > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "SLO 99.5% деградирует ({{ $value | humanizePercentage }} ошибок за 6 часов)"
+          description: "Порог медленного прожига — 3% ошибок за 6 часов."
+
+      # p95 — «типично плохой» пользователь. Порог 1.5 с.
+      - alert: HighLatencyP95
+        expr: instance:http_request_duration_seconds:p95{job="app"} > 1.5
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Медленные ответы: p95 = {{ $value | humanizeDuration }}"
+          description: "95-й перцентиль времени ответа на {{ $labels.instance }} выше 1.5 с уже 10 минут."

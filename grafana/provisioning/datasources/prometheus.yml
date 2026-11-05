@@ -1,0 +1,19 @@
+# Источники данных создаются при старте Grafana: руками в UI ничего добавлять не нужно.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus # на этот uid ссылаются все панели дашбордов
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      prometheusType: Prometheus
+      prometheusVersion: 3.13.0
+      # разрешаем Grafana-алерты на этом источнике (не обязательно, но полезно)
+      manageAlerts: true
+      cacheLevel: Low

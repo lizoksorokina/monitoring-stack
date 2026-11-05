@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  ALERTING RULES — инфраструктура (хост WSL, nginx, postgres)
+#
+#  Пороги намеренно «человеческие»: 85% CPU — это ещё не пожар, поэтому
+#  смотрим 10-15 минут, а не секунды. Иначе ноутбук будет будить по ночам.
+# ─────────────────────────────────────────────────────────────────────────────
+groups:
+  - name: host
+    rules:
+      - alert: HostHighCpuUsage
+        expr: instance:node_cpu:rate5m > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "CPU загружен на {{ $value | humanizePercentage }}"
+          description: "На {{ $labels.instance }} средняя загрузка CPU выше 85% уже 10 минут."
+
+      - alert: HostHighMemoryUsage
+        expr: instance:node_memory_used:ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "Мало свободной памяти ({{ $value | humanizePercentage }} занято)"
+          description: "На {{ $labels.instance }} занято больше 90% RAM. Рядом уже начинается OOM-killer."
+
+      - alert: HostDiskLow
+        expr: instance:node_filesystem_used:ratio > 0.85
+        for: 15m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "Диск {{ $labels.mountpoint }} заполнен на {{ $value | humanizePercentage }}"
+          description: "Файловая система {{ $labels.mountpoint }} на {{ $labels.instance }} заполнена больше чем на 85%."
+
+      - alert: HostDiskCritical
+        expr: instance:node_filesystem_used:ratio > 0.95
+        for: 5m
+        labels:
+          severity: critical
+          component: host
+        annotations:
+          summary: "Диск {{ $labels.mountpoint }} почти полон: {{ $value | humanizePercentage }}"
+          description: "Осталось меньше 5% места. Скоро перестанут писаться логи, TSDB и база."
+
+      # Линейная экстраполяция: если место тает с текущей скоростью —
+      # когда оно кончится? Классический «умный» алерт вместо «диск полон».
+      - alert: HostDiskWillFillIn4Hours
+        expr: predict_linear(node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs", mountpoint!~"/boot.*"}[6h], 4 * 3600) < 0
+        for: 1h
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "Диск {{ $labels.mountpoint }} кончится примерно через 4 часа"
+          description: "При текущей скорости записи свободное место на {{ $labels.mountpoint }} закончится в ближайшие 4 часа."
+
+  - name: edge-and-database
+    rules:
+      - alert: NginxDown
+        expr: nginx_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: edge
+        annotations:
+          summary: "nginx не отдаёт stub_status"
+          description: "Экспортёр не может прочитать статистику nginx на {{ $labels.instance }}."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "PostgreSQL недоступен"
+          description: "postgres-exporter не может подключиться к базе (pg_up = 0)."
+
+      - alert: PostgresTooManyConnections
+        expr: |
+          sum(pg_stat_activity_count) by (instance)
+            /
+          pg_settings_max_connections > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Занято {{ $value | humanizePercentage }} соединений с БД"
+          description: "Использовано больше 80% от max_connections. Скоро новые клиенты начнут получать отказ."

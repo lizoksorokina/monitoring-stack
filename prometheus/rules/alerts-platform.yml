@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  ALERTING RULES — сам мониторинг и синтетика
+#
+#  Идея, которую любят на собеседованиях: «а кто следит за тем, кто следит?»
+#  Если упал Alertmanager или бот — Prometheus всё ещё работает и может
+#  сказать об этом. Если упал Prometheus — сказать уже некому, и это
+#  осознанное ограничение (лечится вторым Prometheus / внешним чекером).
+# ─────────────────────────────────────────────────────────────────────────────
+groups:
+  - name: observability-stack
+    rules:
+      - alert: AlertmanagerDown
+        expr: up{job="alertmanager"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: alerting
+        annotations:
+          summary: "Alertmanager недоступен — алерты не уходят"
+          description: "Prometheus не может достучаться до Alertmanager. Алерты копятся, но в Telegram не попадут."
+
+      - alert: AlertbotDown
+        expr: up{job="alertbot"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: alerting
+        annotations:
+          summary: "Telegram-бот недоступен — доставка сломана"
+          description: "Alertmanager шлёт вебхуки в alertbot, но тот не отвечает. Проверьте логи: docker compose logs alertbot"
+
+      - alert: GrafanaDown
+        expr: up{job="grafana"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: visualization
+        annotations:
+          summary: "Grafana недоступна"
+          description: "Сбор метрик продолжается, но дашборды открыть нельзя."
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: "Prometheus не смог применить конфиг"
+          description: "Последний reload завершился ошибкой. Смотрите promtool check config и логи контейнера."
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: "Ошибки вычисления правил Prometheus"
+          description: "Часть recording/alerting правил падает с ошибкой — значит, часть алертов не считается."
+
+  - name: synthetic
+    rules:
+      # Проба «снаружи»: клиент реально не может получить ответ,
+      # хотя сам таргет, возможно, ещё скрейпится.
+      - alert: ProbeFailed
+        expr: probe_success{job="blackbox-http"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          component: synthetic
+        annotations:
+          summary: "Проба не проходит: {{ $labels.instance }}"
+          description: "blackbox-exporter 3 минуты не может получить успешный ответ от {{ $labels.instance }}."
+
+      - alert: ManyTargetsDown
+        expr: count by (cluster) (up == 0) > 3
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: "Одновременно недоступны {{ $value }} целей"
+          description: "Больше трёх таргетов не отвечают сразу — похоже на проблему хоста или сети, а не одного сервиса."

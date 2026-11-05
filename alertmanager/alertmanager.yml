@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  ALERTMANAGER — «диспетчер» алертов.
+#
+#  Prometheus только решает «условие выполнено / не выполнено».
+#  Всё остальное — группировка, задержки, повторы, подавление — здесь.
+#
+#  Проверить конфиг:  make validate
+#  Перечитать:        curl -X POST http://localhost:9093/-/reload
+# ─────────────────────────────────────────────────────────────────────────────
+global:
+  resolve_timeout: 5m
+
+# ── Дерево маршрутов ────────────────────────────────────────────────────────
+#  Алерт попадает в первый подходящий маршрут и наследует настройки родителя.
+route:
+  receiver: telegram-warning          # куда идёт всё, что не попало в routes
+  group_by: [alertname, cluster, instance]
+  group_wait: 30s                     # подождать 30 с, вдруг прилетит ещё алерт
+  group_interval: 5m                  # как часто дополнять уже отправленную группу
+  repeat_interval: 4h                 # напоминать про всё ещё горящий warning
+
+  routes:
+    # critical — без задержек, будим сразу и напоминаем каждый час
+    - matchers:
+        - 'severity="critical"'
+      receiver: telegram-critical
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+
+# ── Инхибиторы (подавление) ─────────────────────────────────────────────────
+#  Главная идея: один сбой должен рождать ОДНО сообщение, а не десять.
+#  Условие: если есть source-алерт, то target-алерты с теми же значениями
+#  в equal-лейблах не отправляются.
+inhibit_rules:
+  # critical гасит warning по тому же алерту на том же инстансе
+  - source_matchers:
+      - 'severity="critical"'
+    target_matchers:
+      - 'severity="warning"'
+    equal: [alertname, instance]
+
+  # «Сервис лежит» объясняет и ошибки, и латентность — их шум не нужен
+  - source_matchers:
+      - 'alertname="ServiceDown"'
+    target_matchers:
+      - 'alertname=~"HighErrorRate|HighLatencyP95|TargetDown"'
+    equal: [instance]
+
+# ── Получатели ──────────────────────────────────────────────────────────────
+#  Оба шлют на один вебхук бота. Роутинг разделён, чтобы у critical был
+#  свой темп повторов, а не общий на всех.
+receivers:
+  - name: telegram-critical
+    webhook_configs:
+      - url: "http://alertbot:8080/webhook"
+        send_resolved: true
+        max_alerts: 0          # 0 = не обрезать, отдать все алерты пачки
+
+  - name: telegram-warning
+    webhook_configs:
+      - url: "http://alertbot:8080/webhook"
+        send_resolved: true
+        max_alerts: 0

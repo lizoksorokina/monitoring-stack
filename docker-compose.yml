@@ -1,0 +1,251 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Pet-проект: Prometheus + Grafana + Alertmanager + Telegram-бот
+#
+#  Как это связано:
+#    nginx ──► app (FastAPI) ──► postgres
+#      │         │                 │
+#      │         └─ /metrics ──┐   └─ postgres-exporter ─┐
+#      └─ stub_status ─► nginx-exporter ─┐               │
+#                                        ▼               ▼
+#   node-exporter ──────────────► PROMETHEUS ◄──── blackbox-exporter (пробы)
+#   grafana / alertmanager / alertbot ─┘
+#                                     │
+#                          правила → ALERTMANAGER
+#                                     │ webhook
+#                                     ▼
+#                                  alertbot ──► Telegram
+#
+#  Запуск:  docker compose up -d --build
+# ─────────────────────────────────────────────────────────────────────────────
+name: obs-stack
+
+# Общая политика ротации логов: без неё json-file логи растут неограниченно.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ══════════════════════════════════════════════════════════════════════════
+  #  МОНИТОРИРУЕМЫЙ СТЕНД
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # База, с которой работает демо-сервис заказов.
+  postgres:
+    image: postgres:17.5
+    container_name: obs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apppass}
+      POSTGRES_DB: ${POSTGRES_DB:-orders}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d ${POSTGRES_DB:-orders}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+
+  # Демо-сервис: HTTP API «заказы», инструментированное prometheus-client.
+  # Умеет искусственно ломаться (/api/chaos) — чтобы алерты реально срабатывали.
+  app:
+    build:
+      context: ./app
+    image: obs/app:1.0.0
+    container_name: obs-app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-apppass}@postgres:5432/${POSTGRES_DB:-orders}
+      SERVICE_NAME: order-service
+      ENVIRONMENT: pet
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+  # Reverse-proxy перед приложением. Отдаёт /stub_status для nginx-exporter.
+  nginx:
+    image: nginx:1.28.0
+    container_name: obs-nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - app
+    logging: *default-logging
+
+  # ══════════════════════════════════════════════════════════════════════════
+  #  ЭКСПОРТЁРЫ — превращают «внутренности» систем в метрики Prometheus
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # Метрики хоста (CPU/RAM/диск/сеть). Единственный экспортёр, который смотрит
+  # на WSL-машину, а не на контейнер.
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: obs-node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      # rslave здесь НЕ ставим: в WSL2 корень смонтирован без propagation,
+      # и Docker отказывается стартовать с "not a shared or slave mount".
+      - /:/host:ro
+    command:
+      - "--path.rootfs=/host"
+      # не тащим в метрики псевдо-ФС контейнеров и /proc
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker/.+)($$|/)"
+    ports:
+      - "9100:9100"
+    logging: *default-logging
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    container_name: obs-nginx-exporter
+    restart: unless-stopped
+    command:
+      - "--nginx.scrape-uri=http://nginx:80/stub_status"
+    ports:
+      - "9113:9113"
+    depends_on:
+      - nginx
+    logging: *default-logging
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: obs-postgres-exporter
+    restart: unless-stopped
+    environment:
+      # автоматически отдаёт и метрики самого postgres, и pg_up
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-apppass}@postgres:5432/${POSTGRES_DB:-orders}?sslmode=disable"
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  # Синтетические пробы «снаружи»: доступен ли сервис реальному клиенту,
+  # сколько идёт ответ, жив ли сертификат. Это НЕ то же самое, что up у скрейпа.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0
+    container_name: obs-blackbox-exporter
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/blackbox_exporter/config.yml"
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    ports:
+      - "9115:9115"
+    logging: *default-logging
+
+  # ══════════════════════════════════════════════════════════════════════════
+  #  ЯДРО МОНИТОРИНГА
+  # ══════════════════════════════════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    container_name: obs-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--storage.tsdb.retention.size=2GB"
+      # позволяет дёрнуть POST /-/reload вместо перезапуска контейнера
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - alertmanager
+    logging: *default-logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.29.0
+    container_name: obs-alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    depends_on:
+      - alertbot
+    logging: *default-logging
+
+  # Мост «Alertmanager → Telegram». Принимает вебхук, красиво форматирует
+  # и отправляет в чат. Плюс умеет отвечать на /status и /alerts.
+  alertbot:
+    build:
+      context: ./alertbot
+    image: obs/alertbot:1.0.0
+    container_name: obs-alertbot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
+      TELEGRAM_DRY_RUN: ${TELEGRAM_DRY_RUN:-false}
+      PROMETHEUS_URL: http://prometheus:9090
+      ALERTMANAGER_URL: http://alertmanager:9093
+      GRAFANA_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3000}
+      # публичные адреса — для ссылок в сообщениях Telegram
+      PROMETHEUS_PUBLIC_URL: ${PROMETHEUS_PUBLIC_URL:-http://localhost:9090}
+      ALERTMANAGER_PUBLIC_URL: ${ALERTMANAGER_PUBLIC_URL:-http://localhost:9093}
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: obs-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # метрики самой Grafana — их тоже скрейпит Prometheus («мониторим мониторинг»)
+      GF_METRICS_ENABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/app-red.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    logging: *default-logging
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

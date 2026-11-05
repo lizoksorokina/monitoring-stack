@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  blackbox-exporter — «синтетический клиент».
+#
+#  Prometheus не умеет сам ходить по URL, поэтому он просит blackbox:
+#  «проверь http://app:8000/health». Тот делает реальный HTTP-запрос и
+#  возвращает метрики: probe_success, probe_duration_seconds,
+#  probe_http_status_code, probe_ssl_earliest_cert_expiry.
+#
+#  Модуль выбирается параметром ?module=... (см. params в prometheus.yml).
+# ─────────────────────────────────────────────────────────────────────────────
+
+modules:
+  # Базовый HTTP-чек: ожидаем 2xx и укладываемся в таймаут.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      method: GET
+      follow_redirects: true
+      preferred_ip_protocol: ip4
+
+  # Тот же чек, но с явным телом — пригодится, если захотите проверять API
+  # «по-настоящему», а не только /health.
+  http_post_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      valid_status_codes: [200, 201]
+      method: POST
+      preferred_ip_protocol: ip4
+
+  # Проверка «а порт вообще открыт?» — без HTTP. Удобно для TCP-сервисов.
+  tcp_connect:
+    prober: tcp
+    timeout: 5s

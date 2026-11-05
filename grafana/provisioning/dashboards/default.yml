@@ -1,0 +1,17 @@
+# Grafana при старте сама подхватит все *.json из /var/lib/grafana/dashboards.
+# Файлы только читаются: правки из UI не сохраняются обратно (allowUiUpdates
+# включён, чтобы можно было экспериментировать, но эталон — файлы в git).
+apiVersion: 1
+
+providers:
+  - name: pet-project
+    orgId: 1
+    folder: Pet Project
+    folderUid: pet-project
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
